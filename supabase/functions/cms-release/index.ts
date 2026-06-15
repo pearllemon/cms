@@ -1,0 +1,346 @@
+// cms-release — public edge function for the CMS Core distribution pipeline.
+//
+//   GET  /cms-release[?version=x&site_id=y]   → manifest envelope (signed)
+//   POST /cms-release/register                → idempotent child registration
+//   POST /cms-release/heartbeat               → periodic state report
+//   POST /cms-release/upgrade-log             → migration progress events
+//
+// The manifest envelope is shaped EXACTLY as the child SDK expects:
+//
+//   {
+//     siteId, version, previousVersion,
+//     payload: { version, sdk_url, package_url, package_sha256, package_size, package_format, min_compatible_child_version, manifest, migrations: [...] },
+//     payload_canonical: "<the exact bytes that were signed>",
+//     signature_b64, signing_key_id, signed_at,
+//     // legacy / convenience fields (also present at top level):
+//     sdk_url, changelog, recalled, min_compatible_child_version, migrations,
+//     manifest, signature, payload_hash
+//   }
+//
+// All endpoints accept CORS so children running on any origin can reach them.
+
+// deno-lint-ignore-file no-explicit-any
+import { createClient } from "npm:@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+};
+
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+function admin() {
+  return createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
+}
+
+function json(body: unknown, status = 200, extra: Record<string, string> = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json", ...extra },
+  });
+}
+
+// Stable JSON serializer — keys sorted, no whitespace. MUST match the
+// canonicalize() in src/lib/releaseSigning.ts and src/cms-core/verify.ts.
+function canonicalize(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return "[" + value.map(canonicalize).join(",") + "]";
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  return "{" + keys.map((k) =>
+    JSON.stringify(k) + ":" + canonicalize((value as Record<string, unknown>)[k])
+  ).join(",") + "}";
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
+  const url = new URL(req.url);
+  const path = url.pathname.replace(/^.*\/cms-release/, "") || "/";
+
+  try {
+    const sb = admin();
+
+    /* ------------------------- POST /register ------------------------- */
+    if (req.method === "POST" && path.startsWith("/register")) {
+      const body = await req.json().catch(() => ({} as any));
+      const { site_id, site_name, site_url, mode, shim_version } = body || {};
+      if (!site_id) return json({ error: "site_id required" }, 400);
+
+      const { data: existing } = await sb
+        .from("child_installations").select("id, registration_token")
+        .eq("site_id", site_id).maybeSingle();
+
+      const token = existing?.registration_token ||
+        crypto.randomUUID().replace(/-/g, "");
+
+      const row: any = {
+        site_id,
+        site_name: site_name || null,
+        site_url: site_url || null,
+        mode: mode === "hybrid" ? "hybrid" : "child",
+        child_shim_version: shim_version || null,
+        registration_token: token,
+        upgrade_state: "pending",
+        last_seen_at: new Date().toISOString(),
+      };
+
+      if (existing?.id) {
+        await sb.from("child_installations").update(row).eq("id", existing.id);
+      } else {
+        await sb.from("child_installations").insert(row);
+      }
+      return json({ ok: true, site_id, registration_token: token });
+    }
+
+    /* ------------------------- POST /heartbeat ------------------------- */
+    if (req.method === "POST" && path.startsWith("/heartbeat")) {
+      const body = await req.json().catch(() => ({} as any));
+      const {
+        site_id, site_name, site_url, current_version, child_shim_version,
+        upgrade_state, last_error, registration_token,
+      } = body || {};
+      if (!site_id) return json({ error: "site_id required" }, 400);
+
+      const { data: existing } = await sb
+        .from("child_installations")
+        .select("id, registration_token")
+        .eq("site_id", site_id).maybeSingle();
+
+      // Self-heal: accept first-touch + legacy rows with no token yet.
+      // Reject only when the existing bound token disagrees with the one sent.
+      if (existing?.registration_token && registration_token
+          && existing.registration_token !== registration_token) {
+        return json({ error: "invalid registration_token for site_id" }, 403);
+      }
+
+      let row_id = existing?.id ?? null;
+      const token: string = existing?.registration_token
+        || registration_token
+        || crypto.randomUUID().replace(/-/g, "");
+
+      if (!existing) {
+        const ins = await sb.from("child_installations").insert({
+          site_id, site_name: site_name || null, site_url: site_url || null,
+          mode: "child", child_shim_version: child_shim_version || null,
+          registration_token: token, upgrade_state: upgrade_state || "pending",
+          last_seen_at: new Date().toISOString(),
+        }).select("id").maybeSingle();
+        row_id = ins.data?.id ?? null;
+      }
+
+      if (row_id) {
+        await sb.from("child_installations").update({
+          site_name: site_name || null,
+          site_url: site_url || null,
+          current_version: current_version || null,
+          child_shim_version: child_shim_version || null,
+          upgrade_state: upgrade_state || "unknown",
+          last_error: last_error || null,
+          registration_token: token,
+          last_seen_at: new Date().toISOString(),
+        }).eq("id", row_id);
+      }
+      return json({ ok: true, registration_token: token });
+    }
+
+    /* ------------------------- POST /upgrade-log ------------------------- */
+    if (req.method === "POST" && path.startsWith("/upgrade-log")) {
+      const body = await req.json().catch(() => ({} as any));
+      const {
+        site_id, from_version, to_version, status, snapshot, error,
+        duration_ms, registration_token,
+      } = body || {};
+      if (!site_id || !to_version || !status) return json({ error: "missing fields" }, 400);
+
+      const { data: existing } = await sb
+        .from("child_installations")
+        .select("id, registration_token")
+        .eq("site_id", site_id).maybeSingle();
+
+      if (existing?.registration_token && registration_token
+          && existing.registration_token !== registration_token) {
+        return json({ error: "invalid registration_token for site_id" }, 403);
+      }
+
+      await sb.from("child_upgrade_log").insert({
+        site_id, from_version: from_version || null, to_version, status,
+        snapshot: snapshot || null, error: error || null, duration_ms: duration_ms || null,
+      });
+      return json({ ok: true });
+    }
+
+    /* ------------------------- GET manifest ------------------------- */
+    if (req.method === "GET") {
+      const version = url.searchParams.get("version");
+      const siteId = url.searchParams.get("site_id");
+      const action = url.searchParams.get("action");
+      const wantKeys = url.searchParams.get("keys");
+
+      // GET ?keys=1 — trusted Ed25519 public keys for child-side verification.
+      if (wantKeys) {
+        const { data } = await sb
+          .from("cms_signing_keys").select("key_id, public_key, algorithm, is_active")
+          .eq("is_active", true);
+        const trusted: Record<string, string> = {};
+        for (const k of data || []) trusted[k.key_id] = k.public_key;
+        return json(
+          { trusted_keys: trusted },
+          200,
+          { "Cache-Control": "public, s-maxage=60, stale-while-revalidate=600" },
+        );
+      }
+
+      // GET ?action=list — admin convenience listing (no signing required).
+      if (action === "list") {
+        const { data } = await sb
+          .from("cms_releases").select("*")
+          .order("published_at", { ascending: false });
+        return json(
+          { releases: data || [] }, 200,
+          { "Cache-Control": "private, no-store" },
+        );
+      }
+
+      let release: any = null;
+      if (version) {
+        const r = await sb.from("cms_releases").select("*").eq("version", version).maybeSingle();
+        release = r.data;
+      } else {
+        const r = await sb
+          .from("cms_releases").select("*")
+          .eq("is_latest", true).eq("recalled", false).maybeSingle();
+        release = r.data;
+      }
+
+      // GET ?action=manifest&version=X — returns ONLY the populated manifest body.
+      if (action === "manifest") {
+        if (!release) {
+          return json({ status: "no_release", manifest: {} }, 200,
+            { "Cache-Control": "public, s-maxage=10" });
+        }
+        return json(
+          { version: release.version, manifest: release.manifest || {}, published_at: release.published_at },
+          200,
+          { "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300" },
+        );
+      }
+
+      if (!release) {
+        return json(
+          {
+            status: "no_release",
+            ok: true,
+            siteId: siteId || null,
+            version: null,
+            previousVersion: null,
+            payload: null,
+            payload_canonical: null,
+            signature_b64: null,
+            signing_key_id: null,
+            signed_at: null,
+            sdk_url: null,
+            package_url: null,
+            package_sha256: null,
+            package_size: null,
+            package_format: null,
+            bundle_url: null,
+            bundle_sha256: null,
+            bundle_css_url: null,
+            bundle_size: null,
+            changelog: null,
+            min_compatible_child_version: null,
+            recalled: false,
+            published_at: null,
+            manifest: {},
+            migrations: [],
+            signature: null,
+            payload_hash: null,
+            message: "No release has been published yet. The site is connected and will receive the first release automatically.",
+          },
+          200,
+          { "Cache-Control": "public, s-maxage=10, stale-while-revalidate=60" },
+        );
+      }
+
+      const { data: migrationsRaw } = await sb
+        .from("cms_migration_manifest").select("*")
+        .eq("version", release.version).order("order_index");
+      const migrations = (migrationsRaw || []).map((m: any) => ({
+        id: m.migration_id || `${release.version}:${m.order_index}`,
+        order_index: m.order_index,
+        kind: m.kind,
+        payload: m.payload,
+        reversible: !!m.reversible,
+      }));
+
+      const hasPackage = !!(release.package_url || release.package_sha256 || release.package_size);
+      const hasBundle = !!(release.bundle_url || release.bundle_sha256);
+      const payloadComputed: Record<string, unknown> = {
+        version: release.version,
+        sdk_url: release.sdk_url ?? null,
+        min_compatible_child_version: release.min_compatible_child_version ?? null,
+        manifest: release.manifest || {},
+        migrations,
+      };
+      if (hasPackage) {
+        payloadComputed.package_url = release.package_url ?? null;
+        payloadComputed.package_sha256 = release.package_sha256 ?? null;
+        payloadComputed.package_size = release.package_size ?? null;
+        payloadComputed.package_format = release.package_format ?? "zip";
+      }
+      if (hasBundle) {
+        payloadComputed.bundle_url = release.bundle_url ?? null;
+        payloadComputed.bundle_sha256 = release.bundle_sha256 ?? null;
+        payloadComputed.bundle_css_url = release.bundle_css_url ?? null;
+        payloadComputed.bundle_size = release.bundle_size ?? null;
+      }
+      const payload_canonical = release.payload_canonical || canonicalize(payloadComputed);
+
+      let previousVersion: string | null = null;
+      if (siteId) {
+        const { data: inst } = await sb
+          .from("child_installations").select("current_version")
+          .eq("site_id", siteId).maybeSingle();
+        previousVersion = inst?.current_version || null;
+      }
+
+      return json(
+        {
+          siteId: siteId || null,
+          version: release.version,
+          previousVersion,
+          payload: payloadComputed,
+          payload_canonical,
+          signature_b64: release.signature || null,
+          signing_key_id: release.signing_key_id || null,
+          signed_at: release.signed_at || null,
+
+          sdk_url: release.sdk_url,
+          package_url: release.package_url,
+          package_sha256: release.package_sha256,
+          package_size: release.package_size,
+          package_format: release.package_format || "zip",
+          bundle_url: release.bundle_url,
+          bundle_sha256: release.bundle_sha256,
+          bundle_css_url: release.bundle_css_url,
+          bundle_size: release.bundle_size,
+          changelog: release.changelog,
+          min_compatible_child_version: release.min_compatible_child_version,
+          recalled: release.recalled,
+          published_at: release.published_at,
+          manifest: release.manifest || {},
+          migrations,
+          signature: release.signature || null,
+          payload_hash: release.payload_hash || null,
+        },
+        200,
+        { "Cache-Control": "public, s-maxage=30, stale-while-revalidate=300" },
+      );
+    }
+
+    return json({ error: "not found" }, 404);
+  } catch (e: any) {
+    return json({ error: String(e?.message || e) }, 500);
+  }
+});
